@@ -1,0 +1,89 @@
+from urllib.parse import urlencode
+import functools as ft
+from io import BytesIO
+import pandas as pd
+import requests
+import zipfile
+
+def _encode_kwargs(params: dict) -> str:
+    """
+    Encode the url with the params
+
+    Args:
+        params (dict): Dictionary with parameter variables.
+
+    Return:
+        str: Encoded url
+    """
+    base_url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+    valid_params = {"id": "id", "start_date": "cosd", "end_date": "coed", "transform": "transformation",
+                    "freq": "fq", "agg": "fam", "formula": "fml"}
+
+    params = {k: ",".join(v) for k, v in params.items()} if (all(isinstance(v, list) for v in params.values())) else params
+    web_params = {v: params[k] for k, v in valid_params.items() if k in params and params[k]}
+    return f"{base_url}?{urlencode(web_params)}"
+
+
+def _read_data_from_url(url: str) -> pd.DataFrame:
+    """
+    Read the data from the FRED URL. It takes into account if it returns a zip file with multiple csv inside.
+
+    Args:
+        url (str): Encoded url.
+
+    Return:
+        pd.DataFrame: DataFrame with FRED data
+    """
+    response = requests.get(url)
+    content = BytesIO(response.content)
+
+    if response.headers.get("content-type") == "application/zip":
+        with zipfile.ZipFile(content) as zf:
+            csv_files = [f for f in zf.namelist() if f.lower().endswith(".csv")]
+            dfs = [pd.read_csv(zf.open(f)) for f in csv_files]
+            return ft.reduce(lambda left, right: pd.merge(left, right, on="observation_date", how="outer"), dfs)
+    return pd.read_csv(content)
+
+
+def _split_dict(params: dict, max_len: int) -> list:
+    """
+    Split the parameter dictionary into several whose length is less than or equal to the allowed length.
+
+    Args:
+        params (dict[str: str]): Original parameter dictionary
+        max_len (int): Maximum allowed dictionary length.
+
+    Return:
+        list[dict]: List of parameter dictionaries with appropriate length
+    """
+    return [{k: v[idx:idx+max_len] for k, v in params.items()} for idx in range(0, len(params["id"]), max_len)]
+
+
+def get_fred_data(**kwargs) -> pd.DataFrame:
+    """
+    Get FRED series data
+
+    Keyword Args:
+        id (str or list[str]): Id or key of the data series.
+        start_date (str or list[str]): Start date of the data series. Format: YYYY-MM_DD
+        end_date (str or list[str]): End date of the data series. Format: YYYY-MM_DD
+        transform (str or list[str]): Transformation of the data series.
+        freq (str or list[str]): Frequency of the data series.
+        agg (str or list[str]): Aggregation method of the data series.
+        formula (str or list[str]): Formula applied to the data series.
+
+    Return:
+        pd.DataFrame: DataFrame with FRED data
+    """
+    if isinstance(kwargs["id"], str) or (isinstance(kwargs["id"], list) and len(kwargs["id"]) <= 10):
+        url = _encode_kwargs(kwargs)
+        res = _read_data_from_url(url)
+
+    else:
+        urls = [_encode_kwargs(kw) for kw in _split_dict(kwargs, max_len=10)]
+        dfs = [_read_data_from_url(url) for url in urls]
+        res = ft.reduce(lambda left, right: pd.merge(left, right, on="observation_date", how="outer"), dfs)
+
+    cols = res.columns.drop(res.columns[0])
+    res.iloc[:, 0], res[cols] = pd.to_datetime(res.iloc[:, 0]), res[cols].apply(pd.to_numeric, errors='coerce')
+    return res
